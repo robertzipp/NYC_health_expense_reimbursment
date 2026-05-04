@@ -8,6 +8,8 @@ This domain model defines core entities for a Health Care Flexible Spending Acco
 - **Identity boundary:** `employeeId` is the canonical participant key.
 - **Financial integrity:** Election and claim/payment records should be immutable after posting, with correction via reversal/adjustment records.
 - **PHI/PII handling:** Claims, documents, and recipient data contain sensitive data and should be encrypted at rest and tightly access-controlled.
+- **Normalization boundary:** write models should avoid duplicated foreign-key facts when a single authoritative link exists.
+- **Lineage and replay:** exports and financial postings should support deterministic replay and immutable sequence history.
 
 ---
 
@@ -21,7 +23,8 @@ Represents an HCFSA-eligible worker (active, terminated, retired as policy permi
 - `externalEmployeeNumber` (string, HR/payroll key)
 - `agencyId` (string)
 - `firstName`, `lastName`
-- `dateOfBirth`
+- `dateOfBirth` (encrypted vault field)
+- `ageBand` (derived, non-sensitive analytic attribute)
 - `email`, `phone`
 - `employmentStatus` (ACTIVE, LEAVE, TERMINATED)
 - `hireDate`, `terminationDate`
@@ -158,8 +161,8 @@ Captures an employee’s participation status in a plan year.
 
 ### Key fields
 - `enrollmentId`
-- `employeeId`
-- `planYearId`
+- `employeeId` (derived/read-model mirror of Enrollment)
+- `planYearId` (derived/read-model mirror of Enrollment)
 - `enrollmentStatus` (PENDING, ACTIVE, WAIVED, TERMINATED)
 - `effectiveDate`
 - `terminationReason`
@@ -203,8 +206,8 @@ Stores elected annual contribution and payroll deduction cadence.
 ### Key fields
 - `electionId`
 - `enrollmentId`
-- `employeeId`
-- `planYearId`
+- `employeeId` (derived/read-model mirror of Enrollment)
+- `planYearId` (derived/read-model mirror of Enrollment)
 - `annualElectionAmount`
 - `perPayPeriodAmount`
 - `payPeriodsPerYear`
@@ -217,6 +220,10 @@ Stores elected annual contribution and payroll deduction cadence.
 
 ### Required fields
 `electionId`, `enrollmentId`, `annualElectionAmount`, `payPeriodsPerYear`, `effectiveFrom`, `version`.
+
+### Integrity constraints
+- `enrollmentId` is the authoritative relationship for write operations.
+- `employeeId` and `planYearId` must either be derived at read time or validated against Enrollment by database constraint/trigger.
 
 ### Sensitive fields
 Financial deductions.
@@ -252,7 +259,8 @@ Represents a person whose care expenses can be reimbursed (employee, spouse, dep
 - `employeeId`
 - `relationshipType` (SELF, SPOUSE, CHILD, OTHER_DEPENDENT)
 - `firstName`, `lastName`
-- `dateOfBirth`
+- `dateOfBirth` (encrypted vault field)
+- `ageBand` (derived, non-sensitive analytic attribute)
 - `taxDependentFlag`
 - `coverageStartDate`, `coverageEndDate`
 
@@ -293,21 +301,27 @@ Top-level reimbursement request submitted by an employee.
 
 ### Key fields
 - `claimId`
-- `employeeId`
-- `planYearId`
+- `employeeId` (derived/read-model mirror of Enrollment)
+- `planYearId` (derived/read-model mirror of Enrollment)
 - `submittedAt`
 - `claimStatus` (SUBMITTED, IN_REVIEW, APPROVED, PARTIALLY_APPROVED, DENIED, PAID)
-- `totalAmountSubmitted`
-- `totalAmountApproved`
+- `totalAmountSubmitted` (cached aggregate)
+- `totalAmountApproved` (cached aggregate)
+- `lastRecomputedAt`
 - `channel` (WEB, MOBILE, ADMIN)
 
 ### Relationships
-- One Claim has many ClaimExpenses, Documents, ReviewTasks, ReviewDecisions.
+- One Claim has many ClaimExpenses, DocumentLinks, ReviewTasks, ReviewDecisions.
 - One Claim may have one or more PaymentBatchLines.
 - One Claim may have zero or many Appeals.
 
 ### Required fields
 `claimId`, `employeeId`, `planYearId`, `submittedAt`, `claimStatus`, `totalAmountSubmitted`.
+
+### Integrity constraints
+- `totalAmountSubmitted` should reconcile to sum(`ClaimExpense.amountSubmitted`).
+- `totalAmountApproved` should reconcile to adjudication outcomes in `ReviewDecision`.
+- Reconciliation jobs should update `lastRecomputedAt` and emit audit events on drift.
 
 ### Sensitive fields
 Contains PHI/financial information by association.
@@ -345,7 +359,8 @@ Line-item detail for each service or product being claimed.
 - `expenseType`
 - `amountSubmitted`
 - `amountEligible`
-- `diagnosisOrProcedureCode` (optional)
+- `diagnosisOrProcedureCode` (optional, encrypted, policy-gated)
+- `diagnosisCodeAccessReason` (required when code is viewed/edited)
 
 ### Relationships
 - Many ClaimExpenses belong to one Claim.
@@ -384,8 +399,8 @@ Stores metadata for uploaded evidence (receipts, EOBs, letters), with pointer to
 
 ### Key fields
 - `documentId`
-- `ownerType` (CLAIM, APPEAL, MISSING_INFO_REQUEST)
-- `ownerId`
+- `documentHandle` (opaque lookup token)
+- `storageLocatorRef` (internal resolver key, not exposed externally)
 - `fileName`
 - `mimeType`
 - `storageUri`
@@ -395,10 +410,10 @@ Stores metadata for uploaded evidence (receipts, EOBs, letters), with pointer to
 - `documentStatus`
 
 ### Relationships
-- Many Documents can attach to Claim, Appeal, or MissingInformationRequest.
+- Many Documents attach through typed `DocumentLink` records for Claim, Appeal, or MissingInformationRequest ownership.
 
 ### Required fields
-`documentId`, `ownerType`, `ownerId`, `storageUri`, `uploadedAt`, `uploadedBy`.
+`documentId`, `documentHandle`, `uploadedAt`, `uploadedBy`.
 
 ### Sensitive fields
 The file content is highly sensitive; hashes and URIs are sensitive operational data.
@@ -410,11 +425,11 @@ Apply records-retention schedule with legal hold and defensible deletion.
 ```json
 {
   "documentId": "doc_90011",
-  "ownerType": "CLAIM",
-  "ownerId": "clm_778901",
+  "documentHandle": "dhl_8f7d21",
+  "storageLocatorRef": "docloc_prod_2026_02_90011",
   "fileName": "receipt_jan18.pdf",
   "mimeType": "application/pdf",
-  "storageUri": "s3://hcfsa-docs/prod/2026/02/doc_90011.pdf",
+  "storageUri": null,
   "sha256": "f92d38c8a2b5...",
   "uploadedBy": "emp_100245",
   "uploadedAt": "2026-02-05T13:09:21Z",
@@ -479,15 +494,19 @@ Captures adjudication outcomes at claim or line-item level.
 - `claimExpenseId` (nullable for claim-level decisions)
 - `decision` (APPROVE, PARTIAL_APPROVE, DENY, REQUEST_INFO)
 - `approvedAmount`
-- `denialReasonCode` (nullable)
+- `denialReasonCode` (nullable, legacy single-code compatibility field)
+- `reviewTaskId` (nullable)
+- `supersedesDecisionId` (nullable self-reference)
 - `decisionBy`
 - `decisionAt`
 - `notes`
 
 ### Relationships
 - Many ReviewDecisions belong to one Claim.
-- Optional link to one DenialReason.
-- May trigger MissingInformationRequest and Notification.
+- Optional link to one ReviewTask for explicit task-to-decision lineage.
+- May supersede a prior ReviewDecision during rework cycles.
+- Many-to-many denial coding through `ReviewDecisionDenialReason`.
+- May trigger MissingInformationRequest and typed Notification links.
 
 ### Required fields
 `reviewDecisionId`, `claimId`, `decision`, `decisionBy`, `decisionAt`.
@@ -603,6 +622,7 @@ Represents a member appeal against a denial/partial decision.
 - `appealId`
 - `claimId`
 - `employeeId`
+- `appealedReviewDecisionId` (nullable direct link for simple flows)
 - `filedAt`
 - `appealStatus` (FILED, UNDER_REVIEW, UPHELD, OVERTURNED, CLOSED)
 - `appealReason`
@@ -611,6 +631,7 @@ Represents a member appeal against a denial/partial decision.
 
 ### Relationships
 - Many Appeals may reference one Claim.
+- Appeals should link to one or more challenged decisions via `AppealDecisionLink`.
 - One Appeal has many Documents and Notifications.
 
 ### Required fields
@@ -691,6 +712,7 @@ Line-level payment instruction for a specific approved claim (or portion).
 - `paymentBatchId`
 - `claimId`
 - `employeeId`
+- `reviewDecisionId` (adjudication basis for payable amount)
 - `amount`
 - `paymentStatus` (PENDING, SENT, SETTLED, RETURNED)
 - `traceNumber`
@@ -733,15 +755,15 @@ Outbound communication log for employee/admin messages (email/SMS/portal).
 ### Key fields
 - `notificationId`
 - `employeeId`
-- `relatedEntityType`
-- `relatedEntityId`
+- `templateVariables` (tokenized map with sensitivity tags)
+- `containsSensitiveData`
 - `channel` (EMAIL, SMS, PORTAL)
 - `templateCode`
 - `deliveryStatus` (QUEUED, SENT, DELIVERED, FAILED)
 - `sentAt`
 
 ### Relationships
-- Many Notifications can reference Claim, Appeal, MissingInformationRequest, Enrollment.
+- Notifications should reference domain records through typed link tables (e.g., `ClaimNotification`, `AppealNotification`).
 
 ### Required fields
 `notificationId`, `employeeId`, `channel`, `templateCode`, `deliveryStatus`.
@@ -757,8 +779,12 @@ Keep enough for compliance and dispute support; purge/redact payloads per privac
 {
   "notificationId": "ntf_57119",
   "employeeId": "emp_100245",
-  "relatedEntityType": "MISSING_INFO_REQUEST",
-  "relatedEntityId": "mir_302",
+  "templateVariables": {
+    "requestId": "mir_302",
+    "dueDate": "2026-02-20",
+    "sensitivity": "PHI_MINIMIZED"
+  },
+  "containsSensitiveData": true,
   "channel": "EMAIL",
   "templateCode": "MIR_OPEN_V2",
   "deliveryStatus": "DELIVERED",
@@ -783,6 +809,7 @@ Tamper-evident event log of user/system actions for security and compliance.
 - `ipAddress`
 - `userAgent`
 - `beforeHash`, `afterHash`
+- `redactionLevel`
 
 ### Relationships
 - References nearly all mutable domain entities.
@@ -829,6 +856,10 @@ Tracks data extracts/feeds to payroll, finance, BI, regulators, or archival syst
 - `status` (QUEUED, RUNNING, SUCCEEDED, FAILED)
 - `recordCount`
 - `outputUri`
+- `asOfTimestamp`
+- `sourceQueryHash`
+- `schemaVersion`
+- `replayKey`
 - `startedAt`, `finishedAt`
 
 ### Relationships
@@ -871,6 +902,8 @@ Stores tenant/global policy parameters, feature toggles, and operational setting
 - `configId`
 - `scope` (GLOBAL, AGENCY, PLAN_YEAR)
 - `scopeId`
+- `precedence`
+- `isOverride`
 - `configKey`
 - `configValue` (JSON)
 - `effectiveFrom`, `effectiveTo`
@@ -944,3 +977,120 @@ Version every change and retain historical values for reproducibility/audit.
 - Introduce consistent IDs (`emp_*`, `clm_*`, etc.) for observability.
 - Track `createdAt/updatedAt` and `createdBy/updatedBy` on all mutable entities.
 - Add soft-delete flags only where legally permissible; prefer archival states to deletion.
+
+
+---
+
+## 21) ContributionPosting
+
+### Purpose
+Immutable ledger entry representing actual payroll contribution funding activity.
+
+### Key fields
+- `contributionPostingId`
+- `enrollmentId`
+- `employeeId`
+- `planYearId`
+- `payDate`
+- `amount`
+- `postingType` (CREATE, ADJUST, REVERSE)
+- `sourcePayrollRunId`
+- `reversalOfPostingId` (nullable)
+- `sequenceNumber`
+- `effectiveAt`
+
+### Relationships
+- Many ContributionPostings belong to one Enrollment.
+- Contribution postings feed AccountBalanceSnapshot and export deltas.
+
+## 22) AccountBalanceSnapshot
+
+### Purpose
+Materialized read model of available/committed balance by employee and plan year.
+
+### Key fields
+- `snapshotId`
+- `employeeId`
+- `planYearId`
+- `asOfTimestamp`
+- `availableBalance`
+- `committedAmount`
+- `paidAmount`
+- `reconciliationStatus`
+
+## 23) ReviewDecisionDenialReason
+
+### Purpose
+Associative entity for multi-reason denials and member-safe wording.
+
+### Key fields
+- `reviewDecisionId`
+- `denialReasonCode`
+- `rankOrder`
+- `memberVisibleExplanation`
+
+## 24) AppealDecisionLink
+
+### Purpose
+Links an appeal to one or many specific review decisions being challenged.
+
+### Key fields
+- `appealDecisionLinkId`
+- `appealId`
+- `reviewDecisionId`
+- `linkType` (PRIMARY, RELATED)
+
+## 25) DocumentLink
+
+### Purpose
+Typed ownership junction for compliance-grade referential integrity.
+
+### Key fields
+- `documentLinkId`
+- `documentId`
+- `claimId` (nullable)
+- `appealId` (nullable)
+- `missingInformationRequestId` (nullable)
+- `linkType`
+
+## 26) LegalHold
+
+### Purpose
+Suspends purge/deletion for linked records under litigation, audit, or investigation.
+
+### Key fields
+- `legalHoldId`
+- `holdReason`
+- `status` (ACTIVE, RELEASED)
+- `appliesToEntityType`
+- `appliesToEntityId`
+- `placedAt`
+- `releasedAt`
+
+## 27) ExternalIdMapping
+
+### Purpose
+Tracks stable identifiers required by downstream payroll/finance/regulatory consumers.
+
+### Key fields
+- `externalIdMappingId`
+- `entityType`
+- `entityId`
+- `targetSystem`
+- `externalReference`
+- `effectiveFrom`
+- `effectiveTo`
+
+## 28) ExportContractVersion
+
+### Purpose
+Versioned export contract registry with compatibility policy metadata.
+
+### Key fields
+- `exportContractVersionId`
+- `jobType`
+- `schemaVersion`
+- `compatibilityMode`
+- `encodingProfile`
+- `decimalFormatProfile`
+- `activeFrom`
