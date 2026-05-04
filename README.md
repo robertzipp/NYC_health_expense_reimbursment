@@ -1,1 +1,8 @@
-# NYC_health_expense_reimbursment
+# NYC Health Expense Reimbursement
+
+Project documentation has been separated from this README:
+
+- Engineering product brief (phases 2–5): `docs/hcfsa_engineering_product_brief.md`
+- Current-state workflow service blueprint: `docs/hcfsa_current_state_service_blueprint.md`
+
+- Target-state user journeys: `docs/hcfsa_target_state_user_journeys.md`
