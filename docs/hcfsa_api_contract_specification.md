@@ -33,14 +33,6 @@
   }
   ```
 
-
-## 1.1 Target Implementation Stack
-
-- **Client:** React with TypeScript consumes this REST contract through an API client layer.
-- **Server:** .NET / ASP.NET Core Web API owns request validation, authorization checks, claim workflow orchestration, and audit-event emission.
-- **Database:** Microsoft SQL Server persists workflow state using T-SQL migrations and SQL Server-native constraints.
-- **First-slice document handling:** Until compliant binary storage is introduced, document endpoints in the first vertical slice may attach metadata only and must not imply that file bytes are durably stored by the application.
-
 ## 2) Standard Error Codes
 
 - `400 VALIDATION_ERROR`
