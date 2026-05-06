@@ -1,5 +1,13 @@
 # NYC HCFSA Reimbursement Workflow — Engineering Product Brief (Phases 2–5)
 
+
+## Target Implementation Stack
+- **Frontend:** React with TypeScript for employee and staff web workflows.
+- **Backend:** .NET / ASP.NET Core Web API for REST endpoints, orchestration, validation, authorization boundaries, and audit-event creation.
+- **Database:** Microsoft SQL Server with reviewed T-SQL migrations and SQL Server-native types for durable workflow, policy, and audit records.
+- **Current repository baseline:** Existing Python/SQLite code remains a prototype/reference implementation until the React/.NET/T-SQL stack reaches feature parity for the first vertical slice.
+- **First vertical slice constraint:** Implement only draft claim creation, one expense, document metadata attachment, validation, submission, and audit events; exclude payment processing, payroll integration, binary file storage, and legacy-system replacement.
+
 ## Scope
 This brief covers:
 1. Guided claim packet builder
