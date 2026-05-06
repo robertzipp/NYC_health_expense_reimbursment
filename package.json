@@ -1,0 +1,9 @@
+{
+  "name": "nyc-hcfsa-reimbursement-slice",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/js/*.test.js"
+  },
+  "devDependencies": {}
+}
