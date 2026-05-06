@@ -15,6 +15,7 @@ ALLOWED_MIME_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/heic"
 
 MONEY_PATTERN = re.compile(r"^\d+(\.\d{1,2})?$")
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 class ClaimService:
@@ -48,7 +49,7 @@ class ClaimService:
     def add_expense(
         self, actor: ActorContext, claim_id: str, payload: dict[str, object], correlation_id: str | None = None
     ) -> dict[str, object]:
-        claim = self._claim_for_employee_edit(actor, claim_id)
+        self._claim_for_employee_edit(actor, claim_id)
         claimant = self._required_str(payload, "claimant")
         date_of_service = self._required_date(payload, "date_of_service")
         expense_category = self._required_str(payload, "expense_category")
@@ -110,19 +111,25 @@ class ClaimService:
         if expense["claim_id"] != claim_id:
             raise NotFoundError("Expense not found for claim")
         file_name = self._required_str(payload, "file_name")
-        mime_type = self._required_str(payload, "mime_type")
+        mime_type = self._required_str(payload, "mime_type").lower()
         document_type = self._required_str(payload, "document_type")
         size_bytes = self._required_int(payload, "size_bytes")
         checksum_sha256 = payload.get("checksum_sha256")
         details: list[dict[str, str]] = []
+        if "/" in file_name or "\\" in file_name:
+            details.append({"field": "file_name", "issue": "must not contain path separators"})
         if mime_type not in ALLOWED_MIME_TYPES:
             details.append({"field": "mime_type", "issue": "unsupported file type"})
         if size_bytes <= 0:
             details.append({"field": "size_bytes", "issue": "must be greater than 0"})
-        if checksum_sha256 is not None and not isinstance(checksum_sha256, str):
-            details.append({"field": "checksum_sha256", "issue": "must be a string"})
+        if checksum_sha256 is not None:
+            if not isinstance(checksum_sha256, str):
+                details.append({"field": "checksum_sha256", "issue": "must be a string"})
+            elif not SHA256_PATTERN.match(checksum_sha256):
+                details.append({"field": "checksum_sha256", "issue": "must be a 64-character hexadecimal SHA-256"})
         if details:
             raise ValidationError(details=details)
+        checksum_value = checksum_sha256.lower() if isinstance(checksum_sha256, str) else None
         document_id = str(uuid4())
         with self.conn:
             self.conn.execute(
@@ -132,7 +139,7 @@ class ClaimService:
                     checksum_sha256, document_type
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (document_id, claim_id, expense_id, file_name, mime_type, size_bytes, checksum_sha256, document_type),
+                (document_id, claim_id, expense_id, file_name, mime_type, size_bytes, checksum_value, document_type),
             )
             self.audit.record(
                 actor=actor,
@@ -163,9 +170,7 @@ class ClaimService:
     def submit_claim(
         self, actor: ActorContext, claim_id: str, correlation_id: str | None = None
     ) -> dict[str, object]:
-        claim = self._claim_for_employee_edit(actor, claim_id)
-        if claim["status"] != DRAFT:
-            raise ConflictError("Claim cannot be submitted twice")
+        self._claim_for_employee_edit(actor, claim_id)
         result = self._validate_claim(claim_id)
         if not result["valid"]:
             with self.conn:
@@ -319,7 +324,7 @@ class ClaimService:
     @staticmethod
     def _required_int(payload: dict[str, object], field: str) -> int:
         value = payload.get(field)
-        if not isinstance(value, int):
+        if not isinstance(value, int) or isinstance(value, bool):
             raise ValidationError(details=[{"field": field, "issue": "must be an integer"}])
         return value
 
@@ -328,11 +333,17 @@ class ClaimService:
         value = cls._required_str(payload, field)
         if not DATE_PATTERN.match(value):
             raise ValidationError(details=[{"field": field, "issue": "must use YYYY-MM-DD"}])
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            raise ValidationError(details=[{"field": field, "issue": "must be a valid calendar date"}])
         return value
 
     @classmethod
     def _required_money_cents(cls, payload: dict[str, object], field: str) -> int:
         value = payload.get(field)
+        if isinstance(value, bool):
+            raise ValidationError(details=[{"field": field, "issue": "must be a decimal string"}])
         if isinstance(value, int):
             return value * 100
         if isinstance(value, float):
@@ -353,6 +364,8 @@ class ClaimService:
             or service_type.lower() in DOCUMENTATION_NOT_REQUIRED_TYPES
         )
         requested_value = payload.get("documentation_required", True)
+        if not isinstance(requested_value, bool):
+            raise ValidationError(details=[{"field": "documentation_required", "issue": "must be a boolean"}])
         if requested_value is False and not explicit_no_documentation:
             raise ValidationError(
                 details=[

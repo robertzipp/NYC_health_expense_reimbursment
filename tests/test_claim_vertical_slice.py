@@ -56,7 +56,7 @@ class ClaimVerticalSliceTest(unittest.TestCase):
                 "file_name": "receipt.pdf",
                 "mime_type": "application/pdf",
                 "size_bytes": 12345,
-                "checksum_sha256": "abc123",
+                "checksum_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
                 "document_type": "itemized_receipt"
             }
             """,
