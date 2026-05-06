@@ -1,13 +1,5 @@
 # NYC HCFSA Reimbursement Workflow — Engineering Product Brief (Phases 2–5)
 
-
-## Target Implementation Stack
-- **Web framework:** React with TypeScript.
-- **Backend platform:** .NET / ASP.NET Core Web API.
-- **Database platform:** Microsoft SQL Server using T-SQL migrations and reviewed database change scripts.
-- **Implementation boundary:** Existing Python/SQLite prototype assets may be used as behavior references only; the target production implementation should be React/.NET/T-SQL.
-- **First vertical slice:** Draft claim creation, one claim expense, document metadata attachment, validation, submission, and audit events only.
-
 ## Scope
 This brief covers:
 1. Guided claim packet builder

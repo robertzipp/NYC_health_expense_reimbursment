@@ -13,19 +13,6 @@ This domain model defines core entities for a Health Care Flexible Spending Acco
 
 ---
 
-
-## SQL Server Persistence Conventions
-
-The target implementation persists this domain model in Microsoft SQL Server with reviewed T-SQL migrations. Unless a table-specific exception is documented:
-
-- Public resource identifiers should use `uniqueidentifier`.
-- Timestamps should use UTC `datetime2`; service dates and plan-year boundaries should use `date`.
-- Money should use fixed precision `decimal(18,2)`, not floating-point types.
-- Mutable aggregate roots should include `rowversion` for optimistic concurrency.
-- Foreign keys should enforce agency/tenant, employee, plan-year, claim, expense, document, and enrollment relationships.
-- Audit-event tables should be append-only and include tamper-evidence fields such as previous/event hashes.
-- Draft claim records may have `submittedAt`/`SubmittedAtUtc` set to `NULL`; submission makes that timestamp required for the submitted state.
-
 ## 1) Employee
 
 ### Purpose
