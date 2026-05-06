@@ -35,6 +35,7 @@ app.UseExceptionHandler(errorApp =>
 });
 
 var claims = app.MapGroup("/api/v1/claims");
+var receipts = app.MapGroup("/api/v1/receipts");
 
 claims.MapPost("/", (CreateClaimRequest request, HttpContext http, ClaimService service) =>
 {
@@ -69,6 +70,13 @@ claims.MapPost("/{claimId:guid}/expenses/{expenseId:guid}/documents", (Guid clai
     return Results.Created($"/api/v1/claims/{claimId}/expenses/{expenseId}/documents/{result.Id}", result);
 });
 
+claims.MapPost("/{claimId:guid}/expenses/{expenseId:guid}/saved-receipts/{receiptId:guid}", (Guid claimId, Guid expenseId, Guid receiptId, HttpContext http, ClaimService service) =>
+{
+    var actor = ActorContext.FromHeaders(http.Request.Headers);
+    var result = service.AttachSavedReceiptToExpense(actor, claimId, expenseId, receiptId);
+    return Results.Created($"/api/v1/claims/{claimId}/expenses/{expenseId}/documents/{result.Id}", result);
+});
+
 claims.MapPost("/{claimId:guid}/validate", (Guid claimId, HttpContext http, ClaimService service) =>
 {
     var actor = ActorContext.FromHeaders(http.Request.Headers);
@@ -82,10 +90,38 @@ claims.MapPost("/{claimId:guid}/submit", (Guid claimId, HttpContext http, ClaimS
     return result.IsValid ? Results.Ok(result.Claim) : Results.UnprocessableEntity(ErrorEnvelope.BusinessRule(result.Details));
 });
 
+receipts.MapPost("/", (CreateReceiptRequest request, HttpContext http, ClaimService service) =>
+{
+    var actor = ActorContext.FromHeaders(http.Request.Headers);
+    var validation = ClaimApiValidation.ValidateDocument(new AttachDocumentRequest(request.FileName, request.MimeType, request.SizeBytes, request.ChecksumSha256, request.DocumentType));
+    if (validation.Count > 0) return Results.BadRequest(ErrorEnvelope.Validation(validation));
+
+    var result = service.CreateReceipt(actor, request);
+    return Results.Created($"/api/v1/receipts/{result.Id}", result);
+});
+
+receipts.MapGet("/", (bool? includeArchived, HttpContext http, ClaimService service) =>
+{
+    var actor = ActorContext.FromHeaders(http.Request.Headers);
+    return Results.Ok(new { data = service.ListReceipts(actor, includeArchived ?? false) });
+});
+
+receipts.MapMethods("/{receiptId:guid}", ["PATCH", "PUT"], (Guid receiptId, UpdateReceiptRequest request, HttpContext http, ClaimService service) =>
+{
+    var actor = ActorContext.FromHeaders(http.Request.Headers);
+    return Results.Ok(service.UpdateReceipt(actor, receiptId, request));
+});
+
+receipts.MapPost("/{receiptId:guid}/archive", (Guid receiptId, HttpContext http, ClaimService service) =>
+{
+    var actor = ActorContext.FromHeaders(http.Request.Headers);
+    return Results.Ok(service.ArchiveReceipt(actor, receiptId));
+});
+
 app.MapGet("/api/v1/audit-events", (Guid entityId, string? entityType, HttpContext http, ClaimService service) =>
 {
     var actor = ActorContext.FromHeaders(http.Request.Headers);
-    return Results.Ok(new { data = service.AuditEventsForClaim(actor, entityId) });
+    return Results.Ok(new { data = service.AuditEventsForEntity(actor, entityType ?? "claim", entityId) });
 });
 
 app.Run();

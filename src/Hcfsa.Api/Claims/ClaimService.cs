@@ -4,14 +4,12 @@ public sealed class ClaimService(IClaimRepository repository)
 {
     public ClaimResponse CreateClaim(ActorContext actor, CreateClaimRequest request)
     {
-        if (actor.ActorType == "employee" && actor.ActorId != request.EmployeeId)
-        {
-            throw new UnauthorizedAccessException("Employees may only create their own claims.");
-        }
+        if (string.IsNullOrWhiteSpace(request.EmployeeId)) throw new ArgumentException("employee_id is required");
+        if (actor.ActorType == "employee" && actor.ActorId != request.EmployeeId) throw new UnauthorizedAccessException("Employee can only create their own claim.");
 
-        var claim = new ClaimResponse(Guid.NewGuid(), actor.AgencyId, request.EmployeeId, ClaimStatus.Draft, DateTimeOffset.UtcNow, null, []);
+        var claim = new ClaimResponse(Guid.NewGuid(), actor.AgencyId, request.EmployeeId.Trim(), ClaimStatus.Draft, DateTimeOffset.UtcNow, null, []);
         repository.SaveClaim(claim);
-        Audit(actor, "claim.created", "success", claim.Id, new Dictionary<string, object?> { ["employee_id"] = request.EmployeeId });
+        Audit(actor, "claim.created", "success", "claim", claim.Id, new Dictionary<string, object?> { ["employee_id"] = request.EmployeeId });
         return claim;
     }
 
@@ -39,7 +37,7 @@ public sealed class ClaimService(IClaimRepository repository)
             []);
 
         repository.AddExpense(claim.Id, expense);
-        Audit(actor, "claim_expense.added", "success", claim.Id, new Dictionary<string, object?> { ["expense_id"] = expense.Id });
+        Audit(actor, "claim_expense.added", "success", "claim", claim.Id, new Dictionary<string, object?> { ["expense_id"] = expense.Id });
         return expense;
     }
 
@@ -51,19 +49,87 @@ public sealed class ClaimService(IClaimRepository repository)
         var serviceValidation = ClaimApiValidation.ValidateDocument(request);
         if (serviceValidation.Count > 0) throw new ArgumentException(serviceValidation[0].Issue);
 
-        // Only metadata is persisted; document binaries stay in object storage managed by the upload pipeline.
-        var document = new ClaimDocumentResponse(
-            Guid.NewGuid(),
-            expenseId,
-            Path.GetFileName(request.FileName.Trim()),
-            request.MimeType.Trim().ToLowerInvariant(),
-            request.SizeBytes,
-            request.ChecksumSha256.Trim().ToLowerInvariant(),
-            request.DocumentType.Trim(),
-            DateTimeOffset.UtcNow);
-
+        var document = CreateDocument(expenseId, null, request);
         repository.AttachDocument(claim.Id, expenseId, document);
-        Audit(actor, "claim_document.attached", "success", claim.Id, new Dictionary<string, object?> { ["expense_id"] = expenseId, ["document_id"] = document.Id });
+        Audit(actor, "claim_document.attached", "success", "claim", claim.Id, new Dictionary<string, object?> { ["expense_id"] = expenseId, ["document_id"] = document.Id });
+        return document;
+    }
+
+    public ReceiptResponse CreateReceipt(ActorContext actor, CreateReceiptRequest request)
+    {
+        var documentRequest = new AttachDocumentRequest(request.FileName, request.MimeType, request.SizeBytes, request.ChecksumSha256, request.DocumentType);
+        var validation = ClaimApiValidation.ValidateDocument(documentRequest);
+        if (validation.Count > 0) throw new ArgumentException(validation[0].Issue);
+
+        var timestamp = DateTimeOffset.UtcNow;
+        var receipt = new ReceiptResponse(
+            Guid.NewGuid(), actor.AgencyId, actor.ActorId, Path.GetFileName(request.FileName.Trim()), request.MimeType.Trim().ToLowerInvariant(), request.SizeBytes,
+            request.ChecksumSha256.Trim().ToLowerInvariant(), request.DocumentType.Trim(), string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim(),
+            ReceiptStatus.Available, null, null, timestamp, timestamp, null, null);
+
+        repository.SaveReceipt(receipt);
+        Audit(actor, "receipt.created", "success", "receipt", receipt.Id, new Dictionary<string, object?> { ["file_name"] = receipt.FileName });
+        return receipt;
+    }
+
+    public IReadOnlyList<ReceiptResponse> ListReceipts(ActorContext actor, bool includeArchived = false) =>
+        repository.ListReceipts(actor.AgencyId, actor.ActorId, includeArchived);
+
+    public ReceiptResponse UpdateReceipt(ActorContext actor, Guid receiptId, UpdateReceiptRequest request)
+    {
+        var receipt = RequireAccessibleReceipt(actor, receiptId);
+        if (receipt.Status != ReceiptStatus.Available) throw new InvalidOperationException("Only unattached available receipts can be updated.");
+
+        var fileName = request.FileName ?? receipt.FileName;
+        var mimeType = request.MimeType ?? receipt.MimeType;
+        var sizeBytes = request.SizeBytes ?? receipt.SizeBytes;
+        var checksum = request.ChecksumSha256 ?? receipt.ChecksumSha256;
+        var documentType = request.DocumentType ?? receipt.DocumentType;
+        var validation = ClaimApiValidation.ValidateDocument(new AttachDocumentRequest(fileName, mimeType, sizeBytes, checksum, documentType));
+        if (validation.Count > 0) throw new ArgumentException(validation[0].Issue);
+
+        var updated = receipt with
+        {
+            FileName = Path.GetFileName(fileName.Trim()),
+            MimeType = mimeType.Trim().ToLowerInvariant(),
+            SizeBytes = sizeBytes,
+            ChecksumSha256 = checksum.Trim().ToLowerInvariant(),
+            DocumentType = documentType.Trim(),
+            Description = request.Description is null ? receipt.Description : (string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim()),
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+
+        repository.UpdateReceipt(updated);
+        Audit(actor, "receipt.updated", "success", "receipt", updated.Id, new Dictionary<string, object?>());
+        return updated;
+    }
+
+    public ReceiptResponse ArchiveReceipt(ActorContext actor, Guid receiptId)
+    {
+        var receipt = RequireAccessibleReceipt(actor, receiptId);
+        if (receipt.Status != ReceiptStatus.Available) throw new InvalidOperationException("Only unattached available receipts can be archived.");
+
+        var timestamp = DateTimeOffset.UtcNow;
+        var archived = receipt with { Status = ReceiptStatus.Archived, UpdatedAt = timestamp, ArchivedAt = timestamp };
+        repository.UpdateReceipt(archived);
+        Audit(actor, "receipt.archived", "success", "receipt", archived.Id, new Dictionary<string, object?>());
+        return archived;
+    }
+
+    public ClaimDocumentResponse AttachSavedReceiptToExpense(ActorContext actor, Guid claimId, Guid expenseId, Guid receiptId)
+    {
+        var claim = RequireAccessibleDraft(actor, claimId);
+        if (claim.Expenses.All(expense => expense.Id != expenseId)) throw new KeyNotFoundException("Expense was not found on this claim.");
+        var receipt = RequireAccessibleReceipt(actor, receiptId);
+        if (receipt.Status != ReceiptStatus.Available) throw new InvalidOperationException("Only unattached available receipts can be attached.");
+
+        var document = CreateDocument(expenseId, receipt.Id, new AttachDocumentRequest(receipt.FileName, receipt.MimeType, receipt.SizeBytes, receipt.ChecksumSha256, receipt.DocumentType));
+        repository.AttachDocument(claim.Id, expenseId, document);
+
+        var timestamp = DateTimeOffset.UtcNow;
+        repository.UpdateReceipt(receipt with { Status = ReceiptStatus.Attached, ClaimId = claim.Id, ExpenseId = expenseId, AttachedAt = timestamp, UpdatedAt = timestamp });
+        Audit(actor, "receipt.attached", "success", "receipt", receipt.Id, new Dictionary<string, object?> { ["claim_id"] = claim.Id, ["expense_id"] = expenseId, ["document_id"] = document.Id });
+        Audit(actor, "claim_document.attached", "success", "claim", claim.Id, new Dictionary<string, object?> { ["expense_id"] = expenseId, ["document_id"] = document.Id, ["saved_receipt_id"] = receipt.Id });
         return document;
     }
 
@@ -82,13 +148,13 @@ public sealed class ClaimService(IClaimRepository repository)
         var details = ValidateForSubmission(claim);
         if (details.Count > 0)
         {
-            Audit(actor, "claim.validation_failed", "failure", claim.Id, new Dictionary<string, object?> { ["details"] = details });
+            Audit(actor, "claim.validation_failed", "failure", "claim", claim.Id, new Dictionary<string, object?> { ["details"] = details });
             return new ClaimValidationResult(false, details);
         }
 
         var submitted = claim with { Status = ClaimStatus.Submitted, SubmittedAt = DateTimeOffset.UtcNow };
         repository.UpdateClaim(submitted);
-        Audit(actor, "claim.submitted", "success", claim.Id, new Dictionary<string, object?> { ["submitted_at"] = submitted.SubmittedAt });
+        Audit(actor, "claim.submitted", "success", "claim", claim.Id, new Dictionary<string, object?> { ["submitted_at"] = submitted.SubmittedAt });
         return new ClaimValidationResult(true, [], submitted);
     }
 
@@ -96,6 +162,23 @@ public sealed class ClaimService(IClaimRepository repository)
     {
         var claim = RequireAccessible(actor, claimId);
         return repository.GetAuditEvents("claim", claim.Id);
+    }
+
+    public IReadOnlyList<AuditEvent> AuditEventsForEntity(ActorContext actor, string entityType, Guid entityId)
+    {
+        return entityType switch
+        {
+            "claim" => AuditEventsForClaim(actor, entityId),
+            "receipt" => repository.GetAuditEvents("receipt", RequireAccessibleReceipt(actor, entityId).Id),
+            _ => throw new KeyNotFoundException("Entity was not found.")
+        };
+    }
+
+    private ReceiptResponse RequireAccessibleReceipt(ActorContext actor, Guid receiptId)
+    {
+        var receipt = repository.GetReceipt(receiptId) ?? throw new KeyNotFoundException("Receipt was not found.");
+        if (receipt.AgencyId != actor.AgencyId || (actor.ActorType == "employee" && receipt.EmployeeId != actor.ActorId)) throw new UnauthorizedAccessException("Actor cannot access this receipt.");
+        return receipt;
     }
 
     private ClaimResponse RequireAccessibleDraft(ActorContext actor, Guid claimId)
@@ -132,8 +215,11 @@ public sealed class ClaimService(IClaimRepository repository)
         return details;
     }
 
-    private void Audit(ActorContext actor, string eventType, string outcome, Guid claimId, IReadOnlyDictionary<string, object?> data)
+    private static ClaimDocumentResponse CreateDocument(Guid expenseId, Guid? savedReceiptId, AttachDocumentRequest request) =>
+        new(Guid.NewGuid(), expenseId, savedReceiptId, Path.GetFileName(request.FileName.Trim()), request.MimeType.Trim().ToLowerInvariant(), request.SizeBytes, request.ChecksumSha256.Trim().ToLowerInvariant(), request.DocumentType.Trim(), DateTimeOffset.UtcNow);
+
+    private void Audit(ActorContext actor, string eventType, string outcome, string entityType, Guid entityId, IReadOnlyDictionary<string, object?> data)
     {
-        repository.AddAuditEvent(new AuditEvent(Guid.NewGuid(), eventType, outcome, "claim", claimId, actor.ActorType, actor.ActorId, actor.AgencyId, actor.CorrelationId, DateTimeOffset.UtcNow, data));
+        repository.AddAuditEvent(new AuditEvent(Guid.NewGuid(), eventType, outcome, entityType, entityId, actor.ActorType, actor.ActorId, actor.AgencyId, actor.CorrelationId, DateTimeOffset.UtcNow, data));
     }
 }
