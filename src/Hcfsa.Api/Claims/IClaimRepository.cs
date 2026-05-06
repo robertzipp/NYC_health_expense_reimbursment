@@ -7,6 +7,10 @@ public interface IClaimRepository
     void UpdateClaim(ClaimResponse claim);
     void AddExpense(Guid claimId, ClaimExpenseResponse expense);
     void AttachDocument(Guid claimId, Guid expenseId, ClaimDocumentResponse document);
+    ReceiptResponse? GetReceipt(Guid receiptId);
+    IReadOnlyList<ReceiptResponse> ListReceipts(string agencyId, string employeeId, bool includeArchived);
+    void SaveReceipt(ReceiptResponse receipt);
+    void UpdateReceipt(ReceiptResponse receipt);
     void AddAuditEvent(AuditEvent auditEvent);
     IReadOnlyList<AuditEvent> GetAuditEvents(string entityType, Guid entityId);
 }
@@ -15,6 +19,7 @@ public sealed class InMemoryClaimRepository : IClaimRepository
 {
     private readonly object _lock = new();
     private readonly Dictionary<Guid, ClaimResponse> _claims = [];
+    private readonly Dictionary<Guid, ReceiptResponse> _receipts = [];
     private readonly List<AuditEvent> _auditEvents = [];
 
     public ClaimResponse? GetClaim(Guid claimId)
@@ -51,6 +56,34 @@ public sealed class InMemoryClaimRepository : IClaimRepository
                 .ToArray();
             _claims[claimId] = claim with { Expenses = expenses };
         }
+    }
+
+    public ReceiptResponse? GetReceipt(Guid receiptId)
+    {
+        lock (_lock) return _receipts.GetValueOrDefault(receiptId);
+    }
+
+    public IReadOnlyList<ReceiptResponse> ListReceipts(string agencyId, string employeeId, bool includeArchived)
+    {
+        lock (_lock)
+        {
+            return _receipts.Values
+                .Where(receipt => receipt.AgencyId == agencyId && receipt.EmployeeId == employeeId)
+                .Where(receipt => includeArchived || receipt.Status != ReceiptStatus.Archived)
+                .OrderBy(receipt => receipt.CreatedAt)
+                .ThenBy(receipt => receipt.Id)
+                .ToArray();
+        }
+    }
+
+    public void SaveReceipt(ReceiptResponse receipt)
+    {
+        lock (_lock) _receipts.Add(receipt.Id, receipt);
+    }
+
+    public void UpdateReceipt(ReceiptResponse receipt)
+    {
+        lock (_lock) _receipts[receipt.Id] = receipt;
     }
 
     public void AddAuditEvent(AuditEvent auditEvent)

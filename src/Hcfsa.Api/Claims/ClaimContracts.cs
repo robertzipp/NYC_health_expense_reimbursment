@@ -18,6 +18,7 @@ public sealed record ActorContext(string ActorType, string ActorId, string Agenc
 }
 
 public enum ClaimStatus { Draft, Submitted }
+public enum ReceiptStatus { Available, Attached, Archived }
 
 public sealed record CreateClaimRequest(string EmployeeId);
 
@@ -36,6 +37,22 @@ public sealed record AttachDocumentRequest(
     long SizeBytes,
     string ChecksumSha256,
     string DocumentType);
+
+public sealed record CreateReceiptRequest(
+    string FileName,
+    string MimeType,
+    long SizeBytes,
+    string ChecksumSha256,
+    string DocumentType,
+    string? Description);
+
+public sealed record UpdateReceiptRequest(
+    string? FileName,
+    string? MimeType,
+    long? SizeBytes,
+    string? ChecksumSha256,
+    string? DocumentType,
+    string? Description);
 
 public sealed record ClaimResponse(
     Guid Id,
@@ -60,12 +77,31 @@ public sealed record ClaimExpenseResponse(
 public sealed record ClaimDocumentResponse(
     Guid Id,
     Guid ExpenseId,
+    Guid? SavedReceiptId,
     string FileName,
     string MimeType,
     long SizeBytes,
     string ChecksumSha256,
     string DocumentType,
     DateTimeOffset AttachedAt);
+
+public sealed record ReceiptResponse(
+    Guid Id,
+    string AgencyId,
+    string EmployeeId,
+    string FileName,
+    string MimeType,
+    long SizeBytes,
+    string ChecksumSha256,
+    string DocumentType,
+    string? Description,
+    ReceiptStatus Status,
+    Guid? ClaimId,
+    Guid? ExpenseId,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt,
+    DateTimeOffset? AttachedAt,
+    DateTimeOffset? ArchivedAt);
 
 public sealed record ValidationDetail(string Field, string Issue);
 

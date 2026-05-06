@@ -227,3 +227,137 @@ class ClaimVerticalSliceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ReceiptLockerVerticalSliceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conn = connect()
+        apply_migrations(self.conn)
+        seed_minimal_reference_data(self.conn)
+        self.service = ClaimService(self.conn)
+        self.app = ApiApp(self.service)
+        self.actor = ActorContext("employee", "employee-1", "agency-nyc")
+        self.headers = {
+            "X-Actor-Type": "employee",
+            "X-Actor-Id": "employee-1",
+            "X-Agency-Id": "agency-nyc",
+            "X-Correlation-Id": "receipt-locker-test",
+        }
+
+    def test_employee_can_save_receipt_list_it_and_attach_to_draft_expense(self) -> None:
+        receipt_response = self.app.handle(
+            "POST",
+            "/api/v1/receipts",
+            self.headers,
+            """
+            {
+                "file_name": "receipt.pdf",
+                "mime_type": "application/pdf",
+                "size_bytes": 12345,
+                "checksum_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                "document_type": "itemized_receipt",
+                "description": "February copay"
+            }
+            """,
+        )
+        self.assertEqual(receipt_response.status, 201)
+        receipt_id = receipt_response.body["id"]
+        self.assertEqual(receipt_response.body["status"], "Available")
+
+        list_response = self.app.handle("GET", "/api/v1/receipts", self.headers)
+        self.assertEqual(list_response.status, 200)
+        self.assertEqual([receipt["id"] for receipt in list_response.body["data"]], [receipt_id])
+
+        claim = self.service.create_claim(self.actor, {"employee_id": "employee-1"})
+        expense = self.service.add_expense(
+            self.actor,
+            claim["id"],
+            {
+                "claimant": "Ava Lee",
+                "date_of_service": "2026-02-01",
+                "expense_category": "medical",
+                "amount_charged": "45.00",
+                "requested_reimbursement_amount": "45.00",
+                "service_type": "copay",
+            },
+        )
+
+        attach_response = self.app.handle(
+            "POST",
+            f"/api/v1/claims/{claim['id']}/expenses/{expense['id']}/saved-receipts/{receipt_id}",
+            self.headers,
+            "{}",
+        )
+        self.assertEqual(attach_response.status, 201)
+        self.assertEqual(attach_response.body["saved_receipt_id"], receipt_id)
+        self.assertEqual(attach_response.body["document_type"], "itemized_receipt")
+
+        validate_response = self.app.handle("POST", f"/api/v1/claims/{claim['id']}/validate", self.headers, "{}")
+        self.assertEqual(validate_response.status, 200)
+        self.assertTrue(validate_response.body["valid"])
+
+        receipts_after_attach = self.app.handle("GET", "/api/v1/receipts", self.headers).body["data"]
+        self.assertEqual(receipts_after_attach[0]["status"], "Attached")
+        self.assertEqual(receipts_after_attach[0]["claim_id"], claim["id"])
+        self.assertEqual(receipts_after_attach[0]["expense_id"], expense["id"])
+
+        receipt_audit = self.app.handle(
+            "GET", f"/api/v1/audit-events?entity_type=receipt&entity_id={receipt_id}", self.headers
+        )
+        self.assertEqual([event["event_type"] for event in receipt_audit.body["data"]], ["receipt.created", "receipt.attached"])
+
+    def test_unattached_receipt_can_be_updated_or_archived_but_attached_receipt_is_locked(self) -> None:
+        receipt = self.service.create_receipt(
+            self.actor,
+            {
+                "file_name": "receipt.pdf",
+                "mime_type": "application/pdf",
+                "size_bytes": 12345,
+                "checksum_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                "document_type": "itemized_receipt",
+            },
+        )
+
+        update_response = self.app.handle(
+            "PATCH",
+            f"/api/v1/receipts/{receipt['id']}",
+            self.headers,
+            '{"description":"Updated metadata"}',
+        )
+        self.assertEqual(update_response.status, 200)
+        self.assertEqual(update_response.body["description"], "Updated metadata")
+
+        archive_response = self.app.handle("POST", f"/api/v1/receipts/{receipt['id']}/archive", self.headers, "{}")
+        self.assertEqual(archive_response.status, 200)
+        self.assertEqual(archive_response.body["status"], "Archived")
+        self.assertEqual(self.app.handle("GET", "/api/v1/receipts", self.headers).body["data"], [])
+        self.assertEqual(len(self.app.handle("GET", "/api/v1/receipts?include_archived=true", self.headers).body["data"]), 1)
+
+        attached = self.service.create_receipt(
+            self.actor,
+            {
+                "file_name": "attached.png",
+                "mime_type": "image/png",
+                "size_bytes": 99,
+                "checksum_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                "document_type": "itemized_receipt",
+            },
+        )
+        claim = self.service.create_claim(self.actor, {"employee_id": "employee-1"})
+        expense = self.service.add_expense(
+            self.actor,
+            claim["id"],
+            {
+                "claimant": "Ava Lee",
+                "date_of_service": "2026-02-01",
+                "expense_category": "medical",
+                "amount_charged": "45.00",
+                "requested_reimbursement_amount": "45.00",
+                "service_type": "copay",
+            },
+        )
+        self.service.attach_receipt_to_expense(self.actor, claim["id"], expense["id"], attached["id"])
+
+        locked_update = self.app.handle("PATCH", f"/api/v1/receipts/{attached['id']}", self.headers, '{"description":"Nope"}')
+        locked_archive = self.app.handle("POST", f"/api/v1/receipts/{attached['id']}/archive", self.headers, "{}")
+        self.assertEqual(locked_update.status, 409)
+        self.assertEqual(locked_archive.status, 409)
